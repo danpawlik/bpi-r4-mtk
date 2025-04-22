@@ -32,9 +32,11 @@ drv_mac80211_init_device_config() {
 	config_add_string ifname_prefix
 	config_add_string macaddr_base
 	config_add_int radio beacon_int chanbw frag rts
+	config_add_int mbssid mu_onoff sr_enable sr_enhanced rnr obss_interval
 	config_add_int rxantenna txantenna txpower min_tx_power
 	config_add_int num_global_macaddr multiple_bssid
 	config_add_boolean noscan ht_coex acs_exclude_dfs background_radar
+	config_add_boolean noscan ht_coex acs_exclude_dfs background_radar background_cert_mode
 	config_add_array ht_capab
 	config_add_array channels
 	config_add_array scan_list
@@ -57,7 +59,12 @@ drv_mac80211_init_device_config() {
 		he_spr_sr_control \
 		he_spr_psr_enabled \
 		he_bss_color_enabled \
-		he_twt_required
+		he_twt_required \
+		he_twt_responder \
+		etxbfen \
+		itxbfen \
+		lpi_psd \
+		lpi_bcn_enhance
 	config_add_int \
 		beamformer_antennas \
 		beamformee_antennas \
@@ -68,7 +75,13 @@ drv_mac80211_init_device_config() {
 		rx_stbc \
 		tx_stbc \
 		he_bss_color \
-		he_spr_non_srg_obss_pd_max_offset
+		he_spr_non_srg_obss_pd_max_offset \
+		pp_bitmap \
+		pp_mode \
+		eml_disable \
+		eml_resp \
+		sku_idx \
+		lpi_sku_idx
 	config_add_boolean \
 		ldpc \
 		greenfield \
@@ -145,6 +158,7 @@ mac80211_hostapd_setup_base() {
 		append base_cfg "acs_exclude_dfs=1" "$N"
 
 	json_get_vars noscan ht_coex min_tx_power:0 tx_burst
+	json_get_vars etxbfen:1 itxbfen:0 eml_disable eml_resp lpi_psd sku_idx lpi_sku_idx lpi_bcn_enhance
 	json_get_values ht_capab_list ht_capab
 	json_get_values channel_list channels
 
@@ -160,6 +174,14 @@ mac80211_hostapd_setup_base() {
 
 	chan_ofs=0
 	[ "$band" = "6g" ] && chan_ofs=1
+
+	if [ "$band" = "6g" ]; then
+		nl_band=4
+	elif [ "$band" = "5g" ]; then
+		nl_band=2
+	else
+		nl_band=1
+	fi
 
 	if [ "$band" != "6g" ]; then
 		ieee80211n=1
@@ -229,10 +251,13 @@ mac80211_hostapd_setup_base() {
 				max_amsdu:1 \
 				dsss_cck_40:1
 
+			[ "$ht_coex" -eq 1 ] && {
+				set_default obss_interval 300
+				append base_cfg "obss_interval=$obss_interval" "$N"
+			}
+
 			ht_cap_mask=0
-			for cap in $(iw phy "$phy" info | grep -E '^\s*Capabilities:' | cut -d: -f2); do
-				ht_cap_mask="$(($ht_cap_mask | $cap))"
-			done
+			ht_cap_mask=$(iw phy "$phy" info | grep "Band ${nl_band}:" -A 1 | grep 'Capabilities: ' | cut -d: -f2)
 
 			cap_rx_stbc=$((($ht_cap_mask >> 8) & 3))
 			[ "$rx_stbc" -lt "$cap_rx_stbc" ] && cap_rx_stbc="$rx_stbc"
@@ -380,7 +405,6 @@ mac80211_hostapd_setup_base() {
 			vht_link_adapt:3 \
 			vht160:2
 
-		set_default tx_burst 2.0
 		append base_cfg "ieee80211ac=1" "$N"
 		vht_cap=0
 		for cap in $(iw phy "$phy" info | awk -F "[()]" '/VHT Capabilities/ { print $2 }'); do
@@ -404,6 +428,7 @@ mac80211_hostapd_setup_base() {
 			su_beamformee=0
 			mu_beamformer=0
 		}
+
 		mac80211_add_capabilities vht_capab $vht_cap \
 			RXLDPC:0x10::$rxldpc \
 			SHORT-GI-80:0x20::$short_gi_80 \
@@ -500,12 +525,12 @@ mac80211_hostapd_setup_base() {
 			he_spr_sr_control:3 \
 			he_spr_psr_enabled:0 \
 			he_spr_non_srg_obss_pd_max_offset:0 \
-			he_bss_color:128 \
+			he_bss_color \
 			he_bss_color_enabled:1
 
-		he_phy_cap=$(iw phy "$phy" info | sed -n '/HE Iftypes: .*AP/,$p' | awk -F "[()]" '/HE PHY Capabilities/ { print $2 }' | head -1)
+		he_phy_cap=$(iw phy "$phy" info | sed -n '/Band '"${nl_band}"'/,$p' | sed -n '/HE Iftypes: .*AP/,$p' | awk -F "[()]" '/HE PHY Capabilities/ { print $2 }' | head -1)
 		he_phy_cap=${he_phy_cap:2}
-		he_mac_cap=$(iw phy "$phy" info | sed -n '/HE Iftypes: .*AP/,$p' | awk -F "[()]" '/HE MAC Capabilities/ { print $2 }' | head -1)
+		he_mac_cap=$(iw phy "$phy" info | sed -n '/Band '"${nl_band}"'/,$p' | sed -n '/HE Iftypes: .*AP/,$p' | awk -F "[()]" '/HE MAC Capabilities/ { print $2 }' | head -1)
 		he_mac_cap=${he_mac_cap:2}
 
 		append base_cfg "ieee80211ax=1" "$N"
@@ -514,19 +539,31 @@ mac80211_hostapd_setup_base() {
 			append base_cfg "he_oper_centr_freq_seg0_idx=$vht_center_seg0" "$N"
 		}
 
+		[ "$etxbfen" -eq 0 ] && {
+			he_su_beamformer=0
+			he_mu_beamformer=0
+		}
+
 		mac80211_add_he_capabilities \
 			he_su_beamformer:${he_phy_cap:6:2}:0x80:$he_su_beamformer \
 			he_su_beamformee:${he_phy_cap:8:2}:0x1:$he_su_beamformee \
 			he_mu_beamformer:${he_phy_cap:8:2}:0x2:$he_mu_beamformer \
+			he_spr_psr_enabled:${he_phy_cap:14:2}:0x1:$he_spr_psr_enabled \
 			he_twt_required:${he_mac_cap:0:2}:0x6:$he_twt_required
 
+		if [ -n "$he_twt_responder" ]; then
+			append base_cfg "he_twt_responder=$he_twt_responder" "$N"
+		fi
 		if [ "$he_bss_color_enabled" -gt 0 ]; then
+			if !([ "$he_bss_color" -gt 0 ] && [ "$he_bss_color" -le 64 ]); then
+				rand=$(head -n 1 /dev/urandom | tr -dc 0-9 | head -c 2 | sed 's/^0*//')
+				he_bss_color=$((rand % 63 + 1))
+			fi
 			append base_cfg "he_bss_color=$he_bss_color" "$N"
 			[ "$he_spr_non_srg_obss_pd_max_offset" -gt 0 ] && { \
 				append base_cfg "he_spr_non_srg_obss_pd_max_offset=$he_spr_non_srg_obss_pd_max_offset" "$N"
 				he_spr_sr_control=$((he_spr_sr_control | (1 << 2)))
 			}
-			[ "$he_spr_psr_enabled" -gt 0 ] && he_spr_psr_enabled=$((0x${he_phy_cap:14:2} & 0x1))
 			[ "$he_spr_psr_enabled" -gt 0 ] || he_spr_sr_control=$((he_spr_sr_control | (1 << 0)))
 			append base_cfg "he_spr_sr_control=$he_spr_sr_control" "$N"
 		else
@@ -562,6 +599,7 @@ mac80211_hostapd_setup_base() {
 		append base_cfg "he_mu_edca_ac_vo_timer=3" "$N"
 	fi
 
+	set_default tx_burst 2
 	if [ "$enable_be" != "0" ]; then
 
 		json_get_vars \
@@ -607,11 +645,17 @@ ${hostapd_noscan:+noscan=1}
 ${tx_burst:+tx_queue_data2_burst=$tx_burst}
 ${mbssid:+mbssid=$mbssid}
 ${mu_onoff:+mu_onoff=$mu_onoff}
-${itxbfen:+ibf_enable=$itxbfen}
+# dpawlik: why it raises: unknown configuration item 'ibf_enable'
+# where ibf_enabled=0
+# ${itxbfen:+ibf_enable=$itxbfen}
 ${rnr:+rnr=$rnr}
 ${multiple_bssid:+mbssid=$multiple_bssid}
 ${eml_disable:+eml_disable=$eml_disable}
 ${eml_resp:+eml_resp=$eml_resp}
+${lpi_psd:+lpi_psd=$lpi_psd}
+${lpi_bcn_enhance:+lpi_bcn_enhance=$lpi_bcn_enhance}
+${sku_idx:+sku_idx=$sku_idx}
+${lpi_sku_idx:+lpi_sku_idx=$lpi_sku_idx}
 #num_global_macaddr=$num_global_macaddr
 #macaddr_base=$macaddr_base
 $base_cfg
@@ -1264,6 +1308,13 @@ drv_mac80211_setup() {
 
 	[ "$rxantenna" = "$prev_rxantenna" -a "$txantenna" = "$prev_txantenna" ] || mac80211_reset_config "$phy"
 	wireless_set_data phy="$phy" radio="$radio" txantenna="$txantenna" rxantenna="$rxantenna"
+
+	# each phy sleeps different times to prevent for ubus race condition.
+	if [ "$phy" = "phy1" ] || [ "$radio" = "1" ]; then
+		sleep 3;
+	elif [ "$phy" = "phy2" ] || [ "$radio" = "2" ]; then
+		sleep 6;
+	fi
 
 	iw phy "$phy" set antenna $txantenna $rxantenna >/dev/null 2>&1
 	iw phy "$phy" set distance "$distance" >/dev/null 2>&1
