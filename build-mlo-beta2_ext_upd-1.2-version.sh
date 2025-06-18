@@ -1,5 +1,7 @@
 #!/bin/bash
 
+export GIT_SSL_NO_VERIFY=1
+
 rm -rf openwrt
 rm -rf mtk-openwrt-feeds
 
@@ -43,7 +45,7 @@ cd openwrt
 bash ../mtk-openwrt-feeds/autobuild/unified/autobuild.sh filogic-mac80211-bpi-r4 log_file=make
 
 
-\cp -r ../my_files/w-mt7988a.dtsi openwrt/target/linux/mediatek/files-6.6/arch/arm64/boot/dts/mediatek/mt7988a.dtsi
+\cp -r ../my_files/w-mt7988a.dtsi target/linux/mediatek/files-6.6/arch/arm64/boot/dts/mediatek/mt7988a.dtsi
 
 \cp -r ../my_files/luci-app-3ginfo-lite-main/sms-tool/ feeds/packages/utils/sms-tool
 \cp -r ../my_files/luci-app-3ginfo-lite-main/luci-app-3ginfo-lite/ feeds/luci/applications
@@ -52,7 +54,6 @@ bash ../mtk-openwrt-feeds/autobuild/unified/autobuild.sh filogic-mac80211-bpi-r4
 \cp -r ../my_files/luci-app-modemband-main/luci-app-modemband/ feeds/luci/applications
 \cp -r ../my_files/luci-app-modemband-main/modemband/ feeds/packages/net/modemband
 
-cd openwrt
 ./scripts/feeds update -a
 ./scripts/feeds install -a
 
