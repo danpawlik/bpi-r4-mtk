@@ -421,7 +421,6 @@ mac80211_hostapd_setup_base() {
 		vht_cap="$(( ($vht_cap & ~(0x700)) | ($cap_rx_stbc << 8) ))"
 
 		[ "$vht_oper_chwidth" -lt 2 ] && {
-			vht160=0
 			short_gi_160=0
 		}
 
@@ -893,8 +892,8 @@ fill_mld_params() {
                 option_list="$(uci show wireless.$m | tr -s "\n" ' ')"
                 for option in $option_list
                 do
-                        local key="$(echo $option | cut -d '.' -f3 | cut -d '=' -f1)"
-                        local val="$(echo $option | cut -d '.' -f3 | cut -d '=' -f2 | tr -d "'")"
+                        local key="$(echo $option | cut -d '=' -f1 | cut -d '.' -f3)"
+                        local val="$(echo $option | cut -d '=' -f2 | tr -d "'")"
 			[ -n "$key" ] && json_add_string $key $val
                 done
         done
@@ -928,24 +927,24 @@ mac80211_prepare_vif() {
 		json_get_vars mld_addr
 		if [ -z "$mld_addr" ]; then
 			generated_mac=$(mac80211_generate_mac mld)
-			# Split the MAC address to get the last byte
-			b6="${generated_mac##*:}"
+			# Split the MAC address to get the first byte
+			b1="${generated_mac%%:*}"
 
-			# Convert the last byte to a decimal for arithmetic operations
-			b6_dec=$((0x$b6))
+			# Convert the first byte to a decimal for arithmetic operations
+			b1_dec=$((0x$b1))
 
-			# Get the lower four bits (last digit in hexadecimal representation)
-			lower_nibble=$(($b6_dec & 0x0F))
+			# Get the upper 5 bits (first digit in hexadecimal representation)
+			upper_nibble=$(($b1_dec & 0xF8))
 
-			# Rotate the lower four bits based on mld_id
-			# Modulus by 16 ensures that the rotation stays within the bounds of a nibble (4 bits)
-			rotated=$(( (lower_nibble + $mld_id - 1) & 0x0F ))
+			# Rotate the upper 5 bits based on mld_id
+			# Modulus by 32 ensures that the rotation stays within the bounds of a nibble (5 bits)
+			rotated=$(( (upper_nibble + ($mld_id << 3)) & 0xF8 ))
 
-			# Combine the upper four bits with the rotated lower four bits
-			b6_rotated=$(($b6_dec & 0xF0 | rotated))
+			# Combine the lower 3 bits with the rotated upper 5 bits
+			b1_rotated=$(($b1_dec & 0x07 | rotated))
 
 			# Reassemble the MAC address
-			result_mac="${generated_mac%:*}:$(printf '%02X' $b6_rotated)"
+			result_mac="$(printf '%02X' $b1_rotated):${generated_mac#*:}"
 
 			# Add the MAC address to the JSON object
 			json_add_string mld_addr "$result_mac"
@@ -1364,8 +1363,8 @@ mac80211_setup_vif() {
 	json_select ..
 	[ -n "$failed" ] || wireless_add_vif "$name" "$ifname"
 
-	#echo "Setup SMP Affinity"
-	#/sbin/smp-mt76.sh
+	echo "Setup SMP Affinity"
+	/sbin/smp-mt76.sh
 }
 
 get_freq() {
@@ -1618,7 +1617,7 @@ drv_mac80211_setup() {
 	[ -x /usr/sbin/wpa_supplicant ] && wpa_supplicant_set_config "$phy" "$radio"
 	[ -x /usr/sbin/hostapd ] && hostapd_set_config "$phy" "$radio"
 
-	[ -x /usr/sbin/wpa_supplicant ] && wpa_supplicant_start "$phy" "$radio"
+	[ -x /usr/sbin/wpa_supplicant ] && [ -z "$hostapd_ctrl" ] && wpa_supplicant_start "$phy" "$radio"
 
 	json_set_namespace wdev_uc prev
 	wdev_tool "$phy$phy_suffix" set_config "$(json_dump)" $active_ifnames

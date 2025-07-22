@@ -11,6 +11,7 @@ hostapd.data.file_fields = {
 	vlan_file: true,
 	wpa_psk_file: true,
 	sae_password_file: true,
+	rxkh_file: true,
 	accept_mac_file: true,
 	deny_mac_file: true,
 	eap_user_file: true,
@@ -46,6 +47,7 @@ hostapd.data.bss_info_fields = {
 	wpa_pairwise: true,
 	auth_algs: true,
 	ieee80211w: true,
+	owe_transition_ifname: true,
 };
 
 function iface_remove(cfg)
@@ -54,8 +56,7 @@ function iface_remove(cfg)
 		return;
 
 	for (let bss in cfg.bss)
-		if (!bss.mld_ap || bss.mld_primary == 1)
-			wdev_remove(bss.ifname);
+		wdev_remove(bss.ifname);
 }
 
 function iface_gen_config(config, start_disabled)
@@ -88,9 +89,6 @@ start_disabled=1
 function iface_freq_info(iface, config, params)
 {
 	let freq = params.frequency;
-	let bw320_offset = params.bw320_offset;
-	let radio_idx = params.radio_idx;
-	let punct_bitmap = params.punct_bitmap;
 	if (!freq)
 		return null;
 
@@ -99,29 +97,25 @@ function iface_freq_info(iface, config, params)
 		sec_offset = 0;
 
 	let width = 0;
-	if (params.ch_width >= 0){
-		width = params.ch_width;
-	} else {
-		for (let line in config.radio.data) {
-			if (!sec_offset && match(line, /^ht_capab=.*HT40/)) {
-				sec_offset = null; // auto-detect
-				continue;
-			}
-
-			let val = match(line, /^(vht_oper_chwidth|he_oper_chwidth|eht_oper_chwidth)=(\d+)/);
-			if (!val)
-				continue;
-
-			val = int(val[2]);
-			if (val > width)
-				width = val;
+	for (let line in config.radio.data) {
+		if (!sec_offset && match(line, /^ht_capab=.*HT40/)) {
+			sec_offset = null; // auto-detect
+			continue;
 		}
+
+		let val = match(line, /^(vht_oper_chwidth|he_oper_chwidth)=(\d+)/);
+		if (!val)
+			continue;
+
+		val = int(val[2]);
+		if (val > width)
+			width = val;
 	}
 
 	if (freq < 4000)
 		width = 0;
 
-	return hostapd.freq_info(freq, sec_offset, width, bw320_offset, radio_idx, punct_bitmap);
+	return hostapd.freq_info(freq, sec_offset, width);
 }
 
 function iface_add(phy, config, phy_status)
@@ -184,20 +178,17 @@ function __iface_pending_next(pending, state, ret, data)
 		iface_update_supplicant_macaddr(phydev, config);
 		return "create_bss";
 	case "create_bss":
-		if (!bss.mld_ap || bss.mld_primary == 1) {
-			let err = phydev.wdev_add(bss.ifname, {
-				mode: "ap",
-				radio: phydev.radio,
-				mld_radio_mask: bss.mld_radio_mask,
-			});
-			if (err) {
-				hostapd.printf(`Failed to create ${bss.ifname} on phy ${phy}: ${err}`);
-				return null;
-			}
+		let err = phydev.wdev_add(bss.ifname, {
+			mode: "ap",
+			radio: phydev.radio,
+		});
+		if (err) {
+			hostapd.printf(`Failed to create ${bss.ifname} on phy ${phy}: ${err}`);
+			return null;
 		}
 
 		pending.call("wpa_supplicant", "phy_status", {
-			phy: bss.mld_ap ? "phy0" : phydev.phy,
+			phy: phydev.phy,
 			radio: phydev.radio ?? -1,
 		});
 		return "check_phy";
@@ -210,28 +201,19 @@ function __iface_pending_next(pending, state, ret, data)
 			hostapd.printf(`Failed to bring up phy ${phy} ifname=${bss.ifname} with supplicant provided frequency`);
 		}
 		pending.call("wpa_supplicant", "phy_set_state", {
-			phy: bss.mld_ap ? "phy0" : phydev.phy,
-			radio: bss.mld_ap ? 0 : phydev.radio ?? -1,
+			phy: phydev.phy,
+			radio: phydev.radio ?? -1,
 			stop: true
 		});
 		return "wpas_stopped";
 	case "wpas_stopped":
 		if (!iface_add(phy, config))
 			hostapd.printf(`hostapd.add_iface failed for phy ${phy} ifname=${bss.ifname}`);
-		let iface = hostapd.interfaces[phy];
-		if (!bss.mld_ap) {
-			pending.call("wpa_supplicant", "phy_set_state", {
-				phy: phydev.phy,
-				radio: phydev.radio ?? -1,
-				stop: false
-			});
-		} else if (!iface || iface.is_mld_finished()) {
-			pending.call("wpa_supplicant", "phy_set_state", {
-				phy: "phy0",
-				radio: 0,
-				stop: false
-			});
-		}
+		pending.call("wpa_supplicant", "phy_set_state", {
+			phy: phydev.phy,
+			radio: phydev.radio ?? -1,
+			stop: false
+		});
 		return null;
 	case "done":
 	default:
@@ -299,6 +281,7 @@ function iface_macaddr_init(phydev, config, macaddr_list)
 {
 	let macaddr_data = {
 		num_global: config.num_global_macaddr ?? 1,
+		macaddr_base: config.macaddr_base,
 		mbssid: config.mbssid ?? 0,
 	};
 
@@ -369,9 +352,71 @@ function bss_reload_psk(bss, config, old_config)
 	hostapd.printf(`Reload WPA PSK file for bss ${config.ifname}: ${ret}`);
 }
 
+function normalize_rxkhs(txt)
+{
+	const pat = {
+		sep: "\x20",
+		mac: "([[:xdigit:]]{2}:?){5}[[:xdigit:]]{2}",
+		r0kh_id: "[\x21-\x7e]{1,48}",
+		r1kh_id: "([[:xdigit:]]{2}:?){5}[[:xdigit:]]{2}",
+		key: "[[:xdigit:]]{32,}",
+		r0kh: function() {
+			return "r0kh=" + this.mac + this.sep + this.r0kh_id;
+		},
+		r1kh: function() {
+			return "r1kh=" + this.mac + this.sep + this.r1kh_id;
+		},
+		rxkh: function() {
+			return "(" + this.r0kh() + "|" + this.r1kh() + ")" + this.sep + this.key;
+		},
+	};
+
+	let rxkhs = filter(
+		split(txt, "\n"), (line) => match(line, regexp("^" + pat.rxkh() + "$"))
+	) ?? [];
+
+	rxkhs = map(rxkhs, function(k) {
+		k = split(k, " ", 3);
+		k[0] = lc(k[0]);
+		if(match(k[0], /^r1kh/)) {
+			k[1] = lc(k[1]);
+		}
+		if(!k[2] = hostapd.rkh_derive_key(k[2])) {
+			return;
+		}
+		return join(" ", k);
+	});
+
+	return join("\n", sort(filter(rxkhs, length)));
+}
+
+function bss_reload_rxkhs(bss, config, old_config)
+{
+	let bss_rxkhs = join("\n", sort(split(bss.ctrl("GET_RXKHS"), "\n")));
+	let bss_rxkhs_hash = hostapd.sha1(bss_rxkhs);
+
+	if (is_equal(config.hash.rxkh_file, bss_rxkhs_hash)) {
+		if (is_equal(old_config.hash.rxkh_file, config.hash.rxkh_file))
+			return;
+	}
+
+	old_config.hash.rxkh_file = config.hash.rxkh_file;
+	if (!is_equal(old_config, config))
+		return;
+
+	let ret = bss.ctrl("RELOAD_RXKHS");
+	ret ??= "failed";
+
+	hostapd.printf(`Reload RxKH file for bss ${config.ifname}: ${ret}`);
+}
+
 function remove_file_fields(config)
 {
-	return filter(config, (line) => !hostapd.data.file_fields[split(line, "=")[0]]);
+	return filter(config, (line) =>
+		!match(line, /^\s*$/) &&
+		!match(line, /^\s*#/) &&
+		!hostapd.data.file_fields[split(line, "=")[0]]
+	);
 }
 
 function bss_remove_file_fields(config)
@@ -670,6 +715,7 @@ function iface_reload_config(name, phydev, config, old_config)
 		}
 
 		bss_reload_psk(bss, config.bss[i], bss_list_cfg[i]);
+		bss_reload_rxkhs(bss, config.bss[i], bss_list_cfg[i]);
 		if (is_equal(config.bss[i], bss_list_cfg[i]))
 			continue;
 
@@ -767,9 +813,12 @@ function iface_load_config(phy, radio, filename)
 			continue;
 		}
 
-		if (val[0] == "#num_global_macaddr" ||
-		    val[0] == "mbssid")
+		if (val[0] == "#num_global_macaddr")
 			config[substr(val[0], 1)] = int(val[1]);
+		else if (val[0] == "#macaddr_base")
+			config[substr(val[0], 1)] = val[1];
+		else if (val[0] == "mbssid")
+			config[val[0]] = int(val[1]);
 
 		push(config.radio.data, line);
 	}
@@ -787,15 +836,6 @@ function iface_load_config(phy, radio, filename)
 			continue;
 		}
 
-		if (val[0] == "mld_ap" && int(val[1]) == 1)
-			bss.mld_ap = 1;
-
-		if (val[0] == "mld_primary" && int(val[1]) == 1)
-			bss.mld_primary = 1;
-
-		if (val[0] == "mld_radio_mask" && int(val[1]))
-			bss.mld_radio_mask = int(val[1]);
-
 		if (val[0] == "nas_identifier")
 			bss.nasid = val[1];
 
@@ -804,26 +844,17 @@ function iface_load_config(phy, radio, filename)
 			continue;
 		}
 
-		if (hostapd.data.file_fields[val[0]])
-			bss.hash[val[0]] = hostapd.sha1(readfile(val[1]));
+		if (hostapd.data.file_fields[val[0]]) {
+			if (val[0] == "rxkh_file") {
+				bss.hash[val[0]] = hostapd.sha1(normalize_rxkhs(readfile(val[1])));
+			} else {
+				bss.hash[val[0]] = hostapd.sha1(readfile(val[1]));
+			}
+		}
 
 		push(bss.data, line);
 	}
 	f.close();
-
-	let first_mld_bss = 0;
-	for (first_mld_bss = 0; first_mld_bss < length(config.bss); first_mld_bss++) {
-		if (config.bss[first_mld_bss].mld_ap == 1)
-			break;
-	}
-
-	if (length(config.bss) > 1 && config.bss[0].mld_ap != 1 &&
-	    first_mld_bss != length(config.bss)) {
-		let tmp_bss = config.bss[0];
-		config.bss[0] = config.bss[first_mld_bss];
-		config.bss[first_mld_bss] = tmp_bss;
-		hostapd.printf(`mtk: ucode: switch bss[${first_mld_bss}] to first`);
-	}
 
 	return config;
 }
@@ -886,28 +917,13 @@ let main_obj = {
 			up: true,
 			frequency: 0,
 			sec_chan_offset: 0,
-			ch_width: -1,
-			bw320_offset: 1,
-			radio_idx: 0,
 			csa: true,
 			csa_count: 0,
-			punct_bitmap: 0,
 		},
 		call: ex_wrap(function(req) {
 			let phy = phy_name(req.args.phy, req.args.radio);
 			if (req.args.up == null || !phy)
 				return libubus.STATUS_INVALID_ARGUMENT;
-
-			hostapd.printf(`ucode: mtk: apsta state update`);
-			hostapd.printf(`    * phy: ${req.args.phy}`);
-			hostapd.printf(`    * up: ${req.args.up}`);
-			hostapd.printf(`    * freqeuncy: ${req.args.frequency}`);
-			hostapd.printf(`    * sec_chan_offset: ${req.args.sec_chan_offset}`);
-			hostapd.printf(`    * ch_width: ${req.args.ch_width}`);
-			hostapd.printf(`    * bw320_offset: ${req.args.bw320_offset}`);
-			hostapd.printf(`    * radio_idx: ${req.args.radio_idx}`);
-			hostapd.printf(`    * csa: ${req.args.csa}`);
-			hostapd.printf(`    * punct_bitmap: ${req.args.punct_bitmap}`);
 
 			let config = hostapd.data.config[phy];
 			if (!config || !config.bss || !config.bss[0] || !config.bss[0].ifname)
