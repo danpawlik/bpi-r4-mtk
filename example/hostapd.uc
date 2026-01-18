@@ -1,1138 +1,584 @@
-let libubus = require("ubus");
-import { open, readfile } from "fs";
-import { wdev_remove, is_equal, vlist_new, phy_is_fullmac, phy_open, wdev_set_radio_mask } from "common";
+'use strict';
 
-let ubus = libubus.connect(null, 60);
+import {
+	append, append_raw, append_vars, dump_config, flush_config, set_default,
+	wiphy_info, wiphy_band
+} from 'wifi.common';
+import { validate } from 'wifi.validate';
+import * as netifd from 'wifi.netifd';
+import * as iface from 'wifi.iface';
+import * as nl80211 from 'nl80211';
+import * as ap from 'wifi.ap';
+import * as fs from 'fs';
 
-hostapd.data.config = {};
-hostapd.data.pending_config = {};
+const NL80211_EXT_FEATURE_ENABLE_FTM_RESPONDER = 33;
+const NL80211_EXT_FEATURE_RADAR_BACKGROUND = 61;
 
-hostapd.data.file_fields = {
-	vlan_file: true,
-	wpa_psk_file: true,
-	sae_password_file: true,
-	rxkh_file: true,
-	accept_mac_file: true,
-	deny_mac_file: true,
-	eap_user_file: true,
-	ca_cert: true,
-	server_cert: true,
-	server_cert2: true,
-	private_key: true,
-	private_key2: true,
-	dh_file: true,
-	eap_sim_db: true,
-};
+let phy_features = {};
+let phy_capabilities = {};
 
-hostapd.data.iface_fields = {
-	ft_iface: true,
-	upnp_iface: true,
-	snoop_iface: true,
-	bridge: true,
-	iapp_interface: true,
-};
+/* make sure old style UCI and hwmode and newer band properties are correctly resolved */
+function set_device_defaults(config) {
+	/* validate the hw mode */
+	if (config.hw_mode in [ '11a', '11b', '11g', '11ad' ])
+		config.hw_mode = substr(config.hw_mode, 2);
+	else if (config.channel > 14)
+		config.hw_mode = 'a';
+	else
+		config.hw_mode = 'g';
 
-hostapd.data.bss_info_fields = {
-	// radio
-	hw_mode: true,
-	channel: true,
-	ieee80211ac: true,
-	ieee80211ax: true,
+	/* validate band */
+	if (config.band == '2g')
+		config.hw_mode = 'g';
+	else if (config.band in [ '5g', '6g', '60g' ])
+		config.hw_mode = 'a';
+	else
+		switch (config.hw_mode) {
+		case 'a':
+			config.band = '5g';
+			break;
 
-	// bss
-	bssid: true,
-	ssid: true,
-	wpa: true,
-	wpa_key_mgmt: true,
-	wpa_pairwise: true,
-	auth_algs: true,
-	ieee80211w: true,
-	owe_transition_ifname: true,
-};
+		case 'ad':
+			config.band = '60g';
+			break;
 
-function iface_remove(cfg)
-{
-	if (!cfg || !cfg.bss || !cfg.bss[0] || !cfg.bss[0].ifname)
+		default:
+			config.band = '2g';
+			break;
+		}
+}
+
+/* setup sylog / stdout */
+function device_log_append(config) {
+	let log_mask = 0;
+
+	for (let k in [ 'log_mlme', 'log_iapp', 'log_driver', 'log_wpa', 'log_radius', 'log_8021x', 'log_80211' ]) {
+		log_mask <<= 1;
+		log_mask |= config[k] ? 1 : 0;
+	}
+
+	append('logger_syslog', log_mask);
+	append('logger_syslog_level', config.log_level);
+	append('logger_stdout', log_mask);
+	append('logger_stdout_level', config.log_level);
+}
+
+/* setup country code */
+function device_country_code(config) {
+	let status = global.ubus.call('network.wireless', 'status');
+	for (let name, radio in status) {
+		if (!radio.config.country)
+			continue;
+		config.country_code = radio.config.country;
+	}
+
+	if (!exists(config, 'country_code'))
 		return;
 
-	for (let bss in cfg.bss)
-		wdev_remove(bss.ifname);
+	if (config.hw_mode != 'a')
+		delete config.ieee80211h;
+	append_vars(config, [ 'country_code', 'country3', 'ieee80211h' ]);
+	if (config.ieee80211d)
+		append_vars(config, [ 'ieee80211d', 'local_pwr_constraint', 'spectrum_mgmt_required' ]);
 }
 
-function iface_gen_config(config, start_disabled)
-{
-	let str = `data:
-${join("\n", config.radio.data)}
-channel=${config.radio.channel}
-`;
 
-	for (let i = 0; i < length(config.bss); i++) {
-		let bss = config.bss[i];
-		let type = i > 0 ? "bss" : "interface";
-		let nasid = bss.nasid ?? replace(bss.bssid, ":", "");
+/* setup cell density */
+function device_cell_density_append(config) {
+	switch (config.hw_mode) {
+	case 'b':
+		if (config.cell_density == 1) {
+			config.supported_rates ??= [ 5500, 11000 ];
+			config.basic_rates ??= [ 5500, 11000 ];
+		} else if (config.cell_density > 2) {
+			config.supported_rates ??= [ 11000 ];
+			config.basic_rates ??= [ 11000 ];
+		}
+		;;
+	case 'g':
+		if (config.cell_density in [ 0, 1 ]) {
+			if (!config.legacy_rates) {
+				config.supported_rates ??= [ 6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000 ];
+				config.basic_rates ??= [ 6000, 12000, 24000 ];
+			} else if (config.cell_density == 1) {
+				config.supported_rates ??= [ 5500, 6000, 9000, 11000, 12000, 18000, 24000, 36000, 48000, 54000 ];
+				config.basic_rates ??= [ 5500, 11000 ];
+			}
+		} else if (config.cell_density == 2 || (config.cell_density > 3 && config.legacy_rates)) {
+			if (!config.legacy_rates) {
+				config.supported_rates ??= [ 12000, 18000, 24000, 36000, 48000, 54000 ];
+				config.basic_rates ??= [ 12000, 24000 ];
+			} else {
+				config.supported_rates ??= [ 11000, 12000, 18000, 24000, 36000, 48000, 54000 ];
+				config.basic_rates ??= [ 11000 ];
+			}
+		} else if (config.cell_density > 2) {
+			 config.supported_rates ??= [ 24000, 36000, 48000, 54000 ];
+			 config.basic_rates ??= [ 24000 ];
+		}
+		;;
+	case 'a':
+		switch (config.cell_density) {
+		case 1:
+			config.supported_rates ??= [ 6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000 ];
+			config.basic_rates ??= [ 6000, 12000, 24000 ];
+			break;
 
-		str += `
-${type}=${bss.ifname}
-bssid=${bss.bssid}
-${join("\n", bss.data)}
-nas_identifier=${nasid}
-`;
-		if (start_disabled)
-			str += `
-start_disabled=1
-`;
+		case 2:
+			config.supported_rates ??= [ 12000, 18000, 24000, 36000, 48000, 54000 ];
+			config.basic_rates ??= [ 12000, 24000 ];
+			break;
+
+		case 3:
+			config.supported_rates ??= [ 24000, 36000, 48000, 54000 ];
+			config.basic_rates ??= [ 24000 ];
+			break;
+		}
 	}
-
-	return str;
 }
 
-function iface_freq_info(iface, config, params)
-{
-	let freq = params.frequency;
-	if (!freq)
-		return null;
+function device_rates(config) {
+	for (let key in [ 'supported_rates', 'basic_rates' ])
+		config[key] = map(config[key], x => x / 100);
 
-	let sec_offset = params.sec_chan_offset;
-	if (sec_offset != -1 && sec_offset != 1)
-		sec_offset = 0;
+	append_vars(config, [ 'beacon_rate', 'supported_rates', 'basic_rates' ]);
+}
 
-	let width = 0;
-	for (let line in config.radio.data) {
-		if (!sec_offset && match(line, /^ht_capab=.*HT40/)) {
-			sec_offset = null; // auto-detect
-			continue;
+function device_htmode_append(config) {
+	config.channel_offset = config.band == '6g' ? 1 : 0;
+
+	/* 802.11n */
+	config.ieee80211n = 0;
+	if (config.band != '6g') {
+		if (config.htmode in [ 'VHT20', 'HT20', 'HE20', 'EHT20' ]) {
+			config.ieee80211n = 1;
+			config.ht_capab = '';
+		}
+		if (config.htmode in [ 'HT40', 'HT40+', 'HT40-', 'VHT40', 'VHT80', 'VHT160', 'HE40', 'HE80', 'HE160', 'EHT40', 'EHT80', 'EHT160' ]) {
+			config.ieee80211n = 1;
+			if (!config.channel)
+				config.ht_capab = '[HT40+]';
+			else
+				switch (config.hw_mode) {
+				case 'a':
+					switch (((config.channel / 4) + config.channel_offset) % 2) {
+					case 0:
+						config.ht_capab = '[HT40-]';
+						break;
+
+					case 1:
+						config.ht_capab = '[HT40+]';
+						break;
+					}
+					break;
+
+				default:
+					switch (config.htmode) {
+					case 'HT40+':
+					case 'HT40-':
+						config.ht_capab = '[' + config.htmode + ']';
+						break;
+
+					default:
+						if (config.channel < 7)
+							config.ht_capab = '[HT40+]';
+						else
+							config.ht_capab = '[HT40-]';
+						break;
+					}
+				}
 		}
 
-		let val = match(line, /^(vht_oper_chwidth|he_oper_chwidth)=(\d+)/);
-		if (!val)
-			continue;
+		if (config.ieee80211n) {
+			let ht_capab = phy_capabilities.ht_capa;
 
-		val = int(val[2]);
-		if (val > width)
-			width = val;
+			if (ht_capab & 0x1 && config.ldpc)
+				config.ht_capab += '[LDPC]';
+			if (ht_capab & 0x10 && config.greenfield)
+				config.ht_capab += '[GF]';
+			if (ht_capab & 0x20 && config.short_gi_20)
+				config.ht_capab += '[SHORT-GI-20]';
+			if (ht_capab & 0x40 && config.short_gi_40)
+				config.ht_capab += '[SHORT-GI-40]';
+			if (ht_capab & 0x80 && config.tx_stbc)
+				config.ht_capab += '[TX-STBC]';
+			if (ht_capab & 0x800 && config.max_amsdu)
+				config.ht_capab += '[MAX-AMSDU-7935]';
+			if (ht_capab & 0x1000 && config.dsss_cck_40)
+				config.ht_capab += '[DSSS_CCK-40]';
+			let rx_stbc = [ '', '[RX-STBC1]', '[RX-STBC12]', '[RX-STBC123]' ];
+			config.ht_capab += rx_stbc[min(config.rx_stbc, (ht_capab >> 8) & 3)];
+
+			append_vars(config, [ 'ieee80211n', 'ht_coex', 'ht_capab' ]);
+		}
 	}
 
-	if (freq < 4000)
-		width = 0;
+	/* 802.11ac */
+	config.ieee80211ac = 1;
+	config.vht_oper_centr_freq_seg0_idx = 0;
+	config.vht_oper_chwidth = 0;
 
-	return hostapd.freq_info(freq, sec_offset, width);
-}
+	switch (config.htmode) {
+	case 'VHT20':
+	case 'HE20':
+	case 'EHT20':
+		break;
 
-function iface_add(phy, config, phy_status)
-{
-	let config_inline = iface_gen_config(config, !!phy_status);
+	case 'VHT40':
+	case 'HE40':
+	case 'EHT40':
+		config.vht_oper_centr_freq_seg0_idx = config.channel + (((config.channel / 4) + config.channel_offset) % 2 ? 2 : -2);
+		break;
 
-	let bss = config.bss[0];
-	let ret = hostapd.add_iface(`bss_config=${phy}:${config_inline}`);
-	if (ret < 0)
-		return false;
+	case 'VHT80':
+	case 'HE80':
+	case 'EHT80':
+		let delta = [ -6, 6, 2, -2 ];
+		config.vht_oper_centr_freq_seg0_idx = config.channel + delta[((config.channel / 4) + config.channel_offset) % 4];
+		config.vht_oper_chwidth = 1;
+		break;
 
-	if (!phy_status)
-		return true;
+	case 'VHT160':
+	case 'HE160':
+	case 'EHT160':
+		let vht_oper_centr_freq_seg0_idx_map = [[ 64, 50 ], [ 128, 114 ], [ 177, 163 ]];
+		if (config.band == '6g')
+			vht_oper_centr_freq_seg0_idx_map = [
+				[ 29, 15 ], [ 61, 47 ], [ 93, 79 ], [ 125, 111 ],
+				[ 157, 143 ], [ 189, 175 ], [ 221, 207 ]];
+		for (let k, v in vht_oper_centr_freq_seg0_idx_map)
+			if (config.channel >= (v[0] - 28) && config.channel <= v[0]) {
+				config.vht_oper_centr_freq_seg0_idx = v[1];
+				break;
+			}
+		config.vht_oper_chwidth = 2;
+		break;
 
-	let iface = hostapd.interfaces[phy];
-	if (!iface)
-		return false;
-
-	let freq_info = iface_freq_info(iface, config, phy_status);
-
-	return iface.start(freq_info) >= 0;
-}
-
-function iface_config_macaddr_list(config)
-{
-	let macaddr_list = {};
-	for (let i = 0; i < length(config.bss); i++) {
-		let bss = config.bss[i];
-		if (!bss.default_macaddr)
-			macaddr_list[bss.bssid] = i;
-	}
-
-	return macaddr_list;
-}
-
-function iface_update_supplicant_macaddr(phydev, config)
-{
-	let macaddr_list = [];
-	for (let i = 0; i < length(config.bss); i++)
-		push(macaddr_list, config.bss[i].bssid);
-	ubus.defer("wpa_supplicant", "phy_set_macaddr_list", {
-		phy: phydev.name,
-		radio: phydev.radio ?? -1,
-		macaddr: macaddr_list
-	});
-}
-
-function __iface_pending_next(pending, state, ret, data)
-{
-	let config = pending.config;
-	let phydev = pending.phydev;
-	let phy = pending.phy;
-	let bss = config.bss[0];
-
-	if (pending.defer)
-		pending.defer.abort();
-	delete pending.defer;
-	switch (state) {
-	case "init":
-		iface_update_supplicant_macaddr(phydev, config);
-		return "create_bss";
-	case "create_bss":
-		let err = phydev.wdev_add(bss.ifname, {
-			mode: "ap",
-			radio: phydev.radio,
-		});
-		if (err) {
-			hostapd.printf(`Failed to create ${bss.ifname} on phy ${phy}: ${err}`);
-			return null;
-		}
-
-		pending.call("wpa_supplicant", "phy_status", {
-			phy: phydev.phy,
-			radio: phydev.radio ?? -1,
-		});
-		return "check_phy";
-	case "check_phy":
-		let phy_status = data;
-		if (phy_status && phy_status.state == "COMPLETED") {
-			if (iface_add(phy, config, phy_status))
-				return "done";
-
-			hostapd.printf(`Failed to bring up phy ${phy} ifname=${bss.ifname} with supplicant provided frequency`);
-		}
-		pending.call("wpa_supplicant", "phy_set_state", {
-			phy: phydev.phy,
-			radio: phydev.radio ?? -1,
-			stop: true
-		});
-		return "wpas_stopped";
-	case "wpas_stopped":
-		if (!iface_add(phy, config))
-			hostapd.printf(`hostapd.add_iface failed for phy ${phy} ifname=${bss.ifname}`);
-		pending.call("wpa_supplicant", "phy_set_state", {
-			phy: phydev.phy,
-			radio: phydev.radio ?? -1,
-			stop: false
-		});
-		return null;
-	case "done":
 	default:
-		delete hostapd.data.pending_config[phy];
+		config.ieee80211ac = 0;
 		break;
 	}
-}
 
-function iface_pending_next(ret, data)
-{
-	let pending = true;
-	let cfg = this;
-
-	while (pending) {
-		try {
-			this.next_state = __iface_pending_next(cfg, this.next_state, ret, data);
-			if (!this.next_state) {
-				__iface_pending_next(cfg, "done");
-				return;
-			}
-		} catch(e) {
-			hostapd.printf(`Exception: ${e}\n${e.stacktrace[0].context}`);
-			return;
-		}
-		pending = !this.defer;
-	}
-}
-
-function iface_pending_abort()
-{
-	this.next_state = "done";
-	this.next();
-}
-
-function iface_pending_ubus_call(obj, method, arg)
-{
-	let ubus = hostapd.data.ubus;
-	let pending = this;
-	this.defer = ubus.defer(obj, method, arg, (ret, data) => { delete pending.defer; pending.next(ret, data) });
-}
-
-const iface_pending_proto = {
-	next: iface_pending_next,
-	call: iface_pending_ubus_call,
-	abort: iface_pending_abort,
-};
-
-function iface_pending_init(phydev, config)
-{
-	let phy = phydev.name;
-
-	let pending = proto({
-		next_state: "init",
-		phydev: phydev,
-		phy: phy,
-		config: config,
-		next: iface_pending_next,
-	}, iface_pending_proto);
-
-	hostapd.data.pending_config[phy] = pending;
-	pending.next();
-}
-
-function iface_macaddr_init(phydev, config, macaddr_list)
-{
-	let macaddr_data = {
-		num_global: config.num_global_macaddr ?? 1,
-		macaddr_base: config.macaddr_base,
-		mbssid: config.mbssid ?? 0,
-	};
-
-	return phydev.macaddr_init(macaddr_list, macaddr_data);
-}
-
-function iface_restart(phydev, config, old_config)
-{
-	let phy = phydev.name;
-	let pending = hostapd.data.pending_config[phy];
-
-	if (pending)
-		pending.abort();
-
-	hostapd.remove_iface(phy);
-	iface_remove(old_config);
-	iface_remove(config);
-
-	if (!config.bss || !config.bss[0]) {
-		hostapd.printf(`No bss for phy ${phy}`);
-		return;
-	}
-
-	iface_macaddr_init(phydev, config, iface_config_macaddr_list(config));
-	for (let i = 0; i < length(config.bss); i++) {
-		let bss = config.bss[i];
-		if (bss.default_macaddr)
-			bss.bssid = phydev.macaddr_next();
-	}
-
-	iface_pending_init(phydev, config);
-}
-
-function array_to_obj(arr, key, start)
-{
-	let obj = {};
-
-	start ??= 0;
-	for (let i = start; i < length(arr); i++) {
-		let cur = arr[i];
-		obj[cur[key]] = cur;
-	}
-
-	return obj;
-}
-
-function find_array_idx(arr, key, val)
-{
-	for (let i = 0; i < length(arr); i++)
-		if (arr[i][key] == val)
-			return i;
-
-	return -1;
-}
-
-function bss_reload_psk(bss, config, old_config)
-{
-	if (is_equal(old_config.hash.wpa_psk_file, config.hash.wpa_psk_file))
-		return;
-
-	old_config.hash.wpa_psk_file = config.hash.wpa_psk_file;
-	if (!is_equal(old_config, config))
-		return;
-
-	let ret = bss.ctrl("RELOAD_WPA_PSK");
-	ret ??= "failed";
-
-	hostapd.printf(`Reload WPA PSK file for bss ${config.ifname}: ${ret}`);
-}
-
-function normalize_rxkhs(txt)
-{
-	const pat = {
-		sep: "\x20",
-		mac: "([[:xdigit:]]{2}:?){5}[[:xdigit:]]{2}",
-		r0kh_id: "[\x21-\x7e]{1,48}",
-		r1kh_id: "([[:xdigit:]]{2}:?){5}[[:xdigit:]]{2}",
-		key: "[[:xdigit:]]{32,}",
-		r0kh: function() {
-			return "r0kh=" + this.mac + this.sep + this.r0kh_id;
-		},
-		r1kh: function() {
-			return "r1kh=" + this.mac + this.sep + this.r1kh_id;
-		},
-		rxkh: function() {
-			return "(" + this.r0kh() + "|" + this.r1kh() + ")" + this.sep + this.key;
-		},
-	};
-
-	let rxkhs = filter(
-		split(txt, "\n"), (line) => match(line, regexp("^" + pat.rxkh() + "$"))
-	) ?? [];
-
-	rxkhs = map(rxkhs, function(k) {
-		k = split(k, " ", 3);
-		k[0] = lc(k[0]);
-		if(match(k[0], /^r1kh/)) {
-			k[1] = lc(k[1]);
-		}
-		if(!k[2] = hostapd.rkh_derive_key(k[2])) {
-			return;
-		}
-		return join(" ", k);
-	});
-
-	return join("\n", sort(filter(rxkhs, length)));
-}
-
-function bss_reload_rxkhs(bss, config, old_config)
-{
-	let bss_rxkhs = join("\n", sort(split(bss.ctrl("GET_RXKHS"), "\n")));
-	let bss_rxkhs_hash = hostapd.sha1(bss_rxkhs);
-
-	if (is_equal(config.hash.rxkh_file, bss_rxkhs_hash)) {
-		if (is_equal(old_config.hash.rxkh_file, config.hash.rxkh_file))
-			return;
-	}
-
-	old_config.hash.rxkh_file = config.hash.rxkh_file;
-	if (!is_equal(old_config, config))
-		return;
-
-	let ret = bss.ctrl("RELOAD_RXKHS");
-	ret ??= "failed";
-
-	hostapd.printf(`Reload RxKH file for bss ${config.ifname}: ${ret}`);
-}
-
-function remove_file_fields(config)
-{
-	return filter(config, (line) =>
-		!match(line, /^\s*$/) &&
-		!match(line, /^\s*#/) &&
-		!hostapd.data.file_fields[split(line, "=")[0]]
-	);
-}
-
-function bss_remove_file_fields(config)
-{
-	let new_cfg = {};
-
-	for (let key in config)
-		new_cfg[key] = config[key];
-	new_cfg.data = remove_file_fields(new_cfg.data);
-	new_cfg.hash = {};
-	for (let key in config.hash)
-		new_cfg.hash[key] = config.hash[key];
-	delete new_cfg.hash.wpa_psk_file;
-	delete new_cfg.hash.sae_password_file;
-	delete new_cfg.hash.vlan_file;
-
-	return new_cfg;
-}
-
-function bss_ifindex_list(config)
-{
-	config = filter(config, (line) => !!hostapd.data.iface_fields[split(line, "=")[0]]);
-
-	return join(",", map(config, (line) => {
-		try {
-			let file = "/sys/class/net/" + split(line, "=")[1] + "/ifindex";
-			let val = trim(readfile(file));
-			return val;
-		} catch (e) {
-			return "";
-		}
-	}));
-}
-
-function bss_config_hash(config)
-{
-	return hostapd.sha1(remove_file_fields(config) + bss_ifindex_list(config));
-}
-
-function bss_find_existing(config, prev_config, prev_hash)
-{
-	let hash = bss_config_hash(config.data);
-
-	for (let i = 0; i < length(prev_config.bss); i++) {
-		if (!prev_hash[i] || hash != prev_hash[i])
-			continue;
-
-		prev_hash[i] = null;
-		return i;
-	}
-
-	return -1;
-}
-
-function get_config_bss(config, idx)
-{
-	if (!config.bss[idx]) {
-		hostapd.printf(`Invalid bss index ${idx}`);
-		return null;
-	}
-
-	let ifname = config.bss[idx].ifname;
-	if (!ifname)
-		hostapd.printf(`Could not find bss ${config.bss[idx].ifname}`);
-
-	return hostapd.bss[ifname];
-}
-
-function iface_reload_config(name, phydev, config, old_config)
-{
-	let phy = phydev.name;
-
-	if (!old_config || !is_equal(old_config.radio, config.radio))
-		return false;
-
-	if (is_equal(old_config.bss, config.bss))
-		return true;
-
-	if (hostapd.data.pending_config[name])
-		return false;
-
-	if (!old_config.bss || !old_config.bss[0])
-		return false;
-
-	let iface = hostapd.interfaces[name];
-	let iface_name = old_config.bss[0].ifname;
-	if (!iface) {
-		hostapd.printf(`Could not find previous interface ${iface_name}`);
-		return false;
-	}
-
-	let first_bss = hostapd.bss[iface_name];
-	if (!first_bss) {
-		hostapd.printf(`Could not find bss of previous interface ${iface_name}`);
-		return false;
-	}
-
-	let macaddr_list = iface_config_macaddr_list(config);
-	let bss_list = [];
-	let bss_list_cfg = [];
-	let prev_bss_hash = [];
-
-	for (let bss in old_config.bss) {
-		let hash = bss_config_hash(bss.data);
-		push(prev_bss_hash, bss_config_hash(bss.data));
-	}
-
-	// Step 1: find (possibly renamed) interfaces with the same config
-	// and store them in the new order (with gaps)
-	for (let i = 0; i < length(config.bss); i++) {
-		let prev;
-
-		// For fullmac devices, the first interface needs to be preserved,
-		// since it's treated as the master
-		if (!i && phy_is_fullmac(phy)) {
-			prev = 0;
-			prev_bss_hash[0] = null;
-		} else {
-			prev = bss_find_existing(config.bss[i], old_config, prev_bss_hash);
-		}
-		if (prev < 0)
-			continue;
-
-		let cur_config = config.bss[i];
-		let prev_config = old_config.bss[prev];
-
-		let prev_bss = get_config_bss(old_config, prev);
-		if (!prev_bss)
-			return false;
-
-		// try to preserve MAC address of this BSS by reassigning another
-		// BSS if necessary
-		if (cur_config.default_macaddr &&
-		    !macaddr_list[prev_config.bssid]) {
-			macaddr_list[prev_config.bssid] = i;
-			cur_config.bssid = prev_config.bssid;
-		}
-
-		bss_list[i] = prev_bss;
-		bss_list_cfg[i] = old_config.bss[prev];
-	}
-
-	if (config.mbssid && !bss_list_cfg[0]) {
-		hostapd.printf("First BSS changed with MBSSID enabled");
-		return false;
-	}
-
-	// Step 2: if none were found, rename and preserve the first one
-	if (length(bss_list) == 0) {
-		// can't change the bssid of the first bss
-		if (config.bss[0].bssid != old_config.bss[0].bssid) {
-			if (!config.bss[0].default_macaddr) {
-				hostapd.printf(`BSSID of first interface changed: ${lc(old_config.bss[0].bssid)} -> ${lc(config.bss[0].bssid)}`);
-				return false;
-			}
-
-			config.bss[0].bssid = old_config.bss[0].bssid;
-		}
-
-		let prev_bss = get_config_bss(old_config, 0);
-		if (!prev_bss)
-			return false;
-
-		macaddr_list[config.bss[0].bssid] = 0;
-		bss_list[0] = prev_bss;
-		bss_list_cfg[0] = old_config.bss[0];
-		prev_bss_hash[0] = null;
-	}
-
-	// Step 3: delete all unused old interfaces
-	for (let i = 0; i < length(prev_bss_hash); i++) {
-		if (!prev_bss_hash[i])
-			continue;
-
-		let prev_bss = get_config_bss(old_config, i);
-		if (!prev_bss)
-			return false;
-
-		let ifname = old_config.bss[i].ifname;
-		hostapd.printf(`Remove bss '${ifname}' on phy '${name}'`);
-		prev_bss.delete();
-		wdev_remove(ifname);
-	}
-
-	// Step 4: rename preserved interfaces, use temporary name on duplicates
-	let rename_list = [];
-	for (let i = 0; i < length(bss_list); i++) {
-		if (!bss_list[i])
-			continue;
-
-		let old_ifname = bss_list_cfg[i].ifname;
-		let new_ifname = config.bss[i].ifname;
-		if (old_ifname == new_ifname)
-			continue;
-
-		if (hostapd.bss[new_ifname]) {
-			new_ifname = "tmp_" + substr(hostapd.sha1(new_ifname), 0, 8);
-			push(rename_list, i);
-		}
-
-		hostapd.printf(`Rename bss ${old_ifname} to ${new_ifname}`);
-		if (!bss_list[i].rename(new_ifname)) {
-			hostapd.printf(`Failed to rename bss ${old_ifname} to ${new_ifname}`);
-			return false;
-		}
-
-		bss_list_cfg[i].ifname = new_ifname;
-	}
-
-	// Step 5: rename interfaces with temporary names
-	for (let i in rename_list) {
-		let new_ifname = config.bss[i].ifname;
-		if (!bss_list[i].rename(new_ifname)) {
-			hostapd.printf(`Failed to rename bss to ${new_ifname}`);
-			return false;
-		}
-		bss_list_cfg[i].ifname = new_ifname;
-	}
-
-	// Step 6: assign BSSID for newly created interfaces
-	macaddr_list = iface_macaddr_init(phydev, config, macaddr_list);
-	for (let i = 0; i < length(config.bss); i++) {
-		if (bss_list[i])
-			continue;
-		let bsscfg = config.bss[i];
-
-		let mac_idx = macaddr_list[bsscfg.bssid];
-		if (mac_idx < 0)
-			macaddr_list[bsscfg.bssid] = i;
-		if (mac_idx == i)
-			continue;
-
-		// statically assigned bssid of the new interface is in conflict
-		// with the bssid of a reused interface. reassign the reused interface
-		if (!bsscfg.default_macaddr) {
-			// can't update bssid of the first BSS, need to restart
-			if (!mac_idx < 0)
-				return false;
-
-			bsscfg = config.bss[mac_idx];
-		}
-
-		let addr = phydev.macaddr_next(i);
-		if (!addr) {
-			hostapd.printf(`Failed to generate mac address for phy ${name}`);
-			return false;
-		}
-		bsscfg.bssid = addr;
-	}
-
-	let config_inline = iface_gen_config(config);
-
-	// Step 7: fill in the gaps with new interfaces
-	for (let i = 0; i < length(config.bss); i++) {
-		let ifname = config.bss[i].ifname;
-		let bss = bss_list[i];
-
-		if (bss)
-			continue;
-
-		hostapd.printf(`Add bss ${ifname} on phy ${name}`);
-		bss_list[i] = iface.add_bss(config_inline, i);
-		if (!bss_list[i]) {
-			hostapd.printf(`Failed to add new bss ${ifname} on phy ${name}`);
-			return false;
-		}
-	}
-
-	// Step 8: update interface bss order
-	if (!iface.set_bss_order(bss_list)) {
-		hostapd.printf(`Failed to update BSS order on phy '${name}'`);
-		return false;
-	}
-
-	// Step 9: update config
-	for (let i = 0; i < length(config.bss); i++) {
-		if (!bss_list_cfg[i])
-			continue;
-
-		let ifname = config.bss[i].ifname;
-		let bss = bss_list[i];
-
-		if (is_equal(config.bss[i], bss_list_cfg[i]))
-			continue;
-
-		if (is_equal(bss_remove_file_fields(config.bss[i]),
-		             bss_remove_file_fields(bss_list_cfg[i]))) {
-			hostapd.printf(`Update config data files for bss ${ifname}`);
-			if (bss.set_config(config_inline, i, true) < 0) {
-				hostapd.printf(`Could not update config data files for bss ${ifname}`);
-				return false;
-			} else {
-				bss.ctrl("RELOAD_WPA_PSK");
-				continue;
-			}
-		}
-
-		bss_reload_psk(bss, config.bss[i], bss_list_cfg[i]);
-		bss_reload_rxkhs(bss, config.bss[i], bss_list_cfg[i]);
-		if (is_equal(config.bss[i], bss_list_cfg[i]))
-			continue;
-
-		hostapd.printf(`Reload config for bss '${config.bss[0].ifname}' on phy '${name}'`);
-		if (bss.set_config(config_inline, i) < 0) {
-			hostapd.printf(`Failed to set config for bss ${ifname}`);
-			return false;
-		}
-	}
-
-	return true;
-}
-
-function iface_set_config(name, config)
-{
-	let old_config = hostapd.data.config[name];
-
-	hostapd.data.config[name] = config;
-
-	if (!config) {
-		hostapd.remove_iface(name);
-		return iface_remove(old_config);
-	}
-
-	let phy = config.phy;
-	let phydev = phy_open(phy, config.radio_idx);
-	if (!phydev) {
-		hostapd.printf(`Failed to open phy ${phy}`);
-		return false;
-	}
-
-	try {
-		let ret = iface_reload_config(name, phydev, config, old_config);
-		if (ret) {
-			iface_update_supplicant_macaddr(phydev, config);
-			hostapd.printf(`Reloaded settings for phy ${name}`);
-			return 0;
-		}
-	} catch (e) {
-		hostapd.printf(`Error reloading config: ${e}\n${e.stacktrace[0].context}`);
-	}
-
-	hostapd.printf(`Restart interface for phy ${name}`);
-	let ret = iface_restart(phydev, config, old_config);
-
-	return ret;
-}
-
-function config_add_bss(config, name)
-{
-	let bss = {
-		ifname: name,
-		data: [],
-		hash: {}
-	};
-
-	push(config.bss, bss);
-
-	return bss;
-}
-
-function iface_load_config(phy, radio, filename)
-{
-	let f = open(filename, "r");
-	if (!f)
-		return null;
-
-	if (radio < 0)
-		radio = null;
-
-	let config = {
-		phy,
-		radio_idx: radio,
-		radio: {
-			data: []
-		},
-		bss: [],
-		orig_file: filename,
-	};
-
-	let bss;
-	let line;
-	while ((line = rtrim(f.read("line"), "\n")) != null) {
-		let val = split(line, "=", 2);
-		if (!val[0])
-			continue;
-
-		if (val[0] == "interface") {
-			bss = config_add_bss(config, val[1]);
+	config.eht_oper_chwidth = config.vht_oper_chwidth;
+	config.eht_oper_centr_freq_seg0_idx = config.vht_oper_centr_freq_seg0_idx;
+
+	if (config.band == '6g') {
+		config.ieee80211ac = 0;
+
+		switch(config.htmode) {
+		case 'HE20':
+		case 'EHT20':
+			config.op_class = 131;
+			break;
+
+		case 'EHT320':
+			let eht_center_seg0_map = [
+				[ 61, 31 ], [ 125, 95 ], [ 189, 159 ], [ 221, 191 ]
+			];
+
+			for (let k, v in eht_center_seg0_map)
+				if (config.channel <= v[0]) {
+					config.eht_oper_centr_freq_seg0_idx = v[1];
+					break;
+				}
+			config.op_class = 137;
+			config.eht_oper_chwidth = 7;
+			break;
+
+		case 'HE40':
+		case 'HE80':
+		case 'HE160':
+		case 'EHT40':
+		case 'EHT80':
+		case 'EHT160':
+			config.op_class = 132 + config.eht_oper_chwidth;
 			break;
 		}
 
-		if (val[0] == "channel") {
-			config.radio.channel = val[1];
-			continue;
-		}
-
-		if (val[0] == "#num_global_macaddr")
-			config[substr(val[0], 1)] = int(val[1]);
-		else if (val[0] == "#macaddr_base")
-			config[substr(val[0], 1)] = val[1];
-		else if (val[0] == "mbssid")
-			config[val[0]] = int(val[1]);
-
-		push(config.radio.data, line);
+		append_vars(config, [ 'op_class' ]);
 	}
 
-	while ((line = rtrim(f.read("line"), "\n")) != null) {
-		if (line == "#default_macaddr")
-			bss.default_macaddr = true;
-
-		let val = split(line, "=", 2);
-		if (!val[0])
-			continue;
-
-		if (val[0] == "bssid") {
-			bss.bssid = lc(val[1]);
-			continue;
+	if (config.ieee80211ac && config.hw_mode == 'a') {
+		/* VHT capab */
+		if (config.vht_oper_chwidth < 2) {
+			config.vht160 = 0;
+			config.short_gi_160 = 0;
 		}
 
-		if (val[0] == "nas_identifier")
-			bss.nasid = val[1];
+		set_default(config, 'tx_queue_data2_burst', '2.0');
 
-		if (val[0] == "bss") {
-			bss = config_add_bss(config, val[1]);
-			continue;
-		}
+		let vht_capab = phy_capabilities.vht_capa;
+		
+		config.vht_capab = '';
+		if (vht_capab & 0x10 && config.rxldpc)
+			config.vht_capab += '[RXLDPC]';
+		if (vht_capab & 0x20 && config.short_gi_80)
+			config.vht_capab += '[SHORT-GI-80]';
+		if (vht_capab & 0x40 && config.short_gi_160)
+			config.vht_capab += '[SHORT-GI-160]';
+		if (vht_capab & 0x80 && config.tx_stbc_2by1)
+			config.vht_capab += '[TX-STBC-2BY1]';
+		if (vht_capab & 0x800 && config.su_beamformer)
+			config.vht_capab += '[SU-BEAMFORMER]';
+		if (vht_capab & 0x1000 && config.su_beamformee)
+			config.vht_capab += '[SU-BEAMFORMEE]';
+		if (vht_capab & 0x80000 && config.mu_beamformer)
+			config.vht_capab += '[MU-BEAMFORMER]';
+		if (vht_capab & 0x100000 && config.mu_beamformee)
+			config.vht_capab += '[MU-BEAMFORMEE]';
+		if (vht_capab & 0x200000 && config.vht_txop_ps)
+			config.vht_capab += '[VHT-TXOP-PS]';
+		if (vht_capab & 0x400000 && config.htc_vht)
+			config.vht_capab += '[HTC-VHT]';
+		if (vht_capab & 0x10000000 && config.rx_antenna_pattern)
+			config.vht_capab += '[RX-ANTENNA-PATTERN]';
+		if (vht_capab & 0x20000000 && config.tx_antenna_pattern)
+			config.vht_capab += '[TX-ANTENNA-PATTERN]';
+		let rx_stbc = [ '', '[RX-STBC-1]', '[RX-STBC-12]', '[RX-STBC-123]', '[RX-STBC-1234]' ];
+		config.vht_capab += rx_stbc[min(config.rx_stbc, (vht_capab >> 8) & 7)];
 
-		if (hostapd.data.file_fields[val[0]]) {
-			if (val[0] == "rxkh_file") {
-				bss.hash[val[0]] = hostapd.sha1(normalize_rxkhs(readfile(val[1])));
-			} else {
-				bss.hash[val[0]] = hostapd.sha1(readfile(val[1]));
+		if (vht_capab & 0x800 && config.su_beamformer)
+			config.vht_capab += '[SOUNDING-DIMENSION-' + min(((vht_capab >> 16) & 3) + 1, config.beamformer_antennas) + ']';
+		if (vht_capab & 0x1000 && config.su_beamformee)
+			config.vht_capab += '[BF-ANTENNA-' + min(((vht_capab >> 13) & 3) + 1, config.beamformer_antennas) + ']';
+
+		/* supported Channel widths */
+		if ((vht_capab & 0xc) == 8 && config.vht160 <= 2)
+			config.vht_capab += '[VHT160-80PLUS80]';
+		else if ((vht_capab & 0xc) == 4 && config.vht160 <= 2)
+			config.vht_capab += '[VHT160]';
+
+		/* maximum MPDU length */
+		if ((vht_capab & 3) > 1 && config.vht_max_mpdu >= 11454)
+			config.vht_capab += '[MAX-MPDU-11454]';
+		else if ((vht_capab & 3) && config.vht_max_mpdu >= 7991)
+			config.vht_capab += '[MAX-MPDU-7991]';
+
+		/* maximum A-MPDU length exponent */
+		let max_a_mpdu_len_exp = (vht_capab >> 20) & 0x38;
+		for (let exp = 7; exp; exp--)
+			if (max_a_mpdu_len_exp >= (0x8 * exp) && exp <= config.vht_max_a_mpdu_len_exp) {
+				config.vht_capab += '[MAX-A-MPDU-LEN-EXP' + exp + ']';
+				break;
 			}
+
+		/* whether or not the STA supports link adaptation using VHT variant */
+		let vht_link_adapt = vht_capab & 0xC000000;
+		if (vht_link_adapt >= 0xC000000 && config.vht_link_adapt > 3)
+			config.vht_capab += '[VHT-LINK-ADAPT-3]';
+		if (vht_link_adapt >= 0x8000000 && config.vht_link_adapt > 2)
+			config.vht_capab += '[VHT-LINK-ADAPT-2]';
+
+		append_vars(config, [
+			'ieee80211ac', 'vht_oper_chwidth', 'vht_oper_centr_freq_seg0_idx',
+			'vht_capab'
+		]);
+	}
+
+	/* 802.11ax */
+	if (wildcard(config.htmode, 'HE*') || wildcard(config.htmode, 'EHT*')) {
+		let he_phy_cap = phy_capabilities.he_phy_cap;
+		let he_mac_cap = phy_capabilities.he_mac_cap;
+
+		config.ieee80211ax = true;
+
+		if (config.hw_mode == 'a') {
+			config.he_oper_chwidth = config.vht_oper_chwidth;
+			config.he_oper_centr_freq_seg0_idx = config.vht_oper_centr_freq_seg0_idx;
 		}
 
-		push(bss.data, line);
-	}
-	f.close();
+		if (config.band == "6g") {
+			config.stationary_ap = true;
+			append_vars(config, [ 'he_6ghz_reg_pwr_type', ]);
+		}
 
-	return config;
+		if (config.he_bss_color_enabled) {
+			if (config.he_spr_non_srg_obss_pd_max_offset)
+				config.he_spr_sr_control |= 1 << 2;
+			if (!config.he_spr_psr_enabled)
+				config.he_spr_sr_control |= 1;
+			append_vars(config, [ 'he_bss_color', 'he_spr_non_srg_obss_pd_max_offset', 'he_spr_sr_control' ]);
+		}
+
+		if (!(he_phy_cap[3] & 0x80))
+			config.he_su_beamformer = false;
+		if (!(he_phy_cap[4] & 0x1))
+			config.he_su_beamformee = false;
+		if (!(he_phy_cap[4] & 0x2))
+			config.he_mu_beamformer = false;
+		if (!(he_phy_cap[7] & 0x1))
+			config.he_spr_psr_enabled = false;
+		if (!(he_mac_cap[0] & 0x1))
+			config.he_twt_required= false;
+
+		append_vars(config, [
+			'ieee80211ax', 'he_oper_chwidth', 'he_oper_centr_freq_seg0_idx',
+			'he_su_beamformer', 'he_su_beamformee', 'he_mu_beamformer', 'he_twt_required',
+			'he_default_pe_duration', 'he_rts_threshold', 'he_mu_edca_qos_info_param_count',
+			'he_mu_edca_qos_info_q_ack', 'he_mu_edca_qos_info_queue_request', 'he_mu_edca_qos_info_txop_request',
+			'he_mu_edca_ac_be_aifsn', 'he_mu_edca_ac_be_aci', 'he_mu_edca_ac_be_ecwmin',
+			'he_mu_edca_ac_be_ecwmax', 'he_mu_edca_ac_be_timer', 'he_mu_edca_ac_bk_aifsn',
+			'he_mu_edca_ac_bk_aci', 'he_mu_edca_ac_bk_ecwmin', 'he_mu_edca_ac_bk_ecwmax',
+			'he_mu_edca_ac_bk_timer', 'he_mu_edca_ac_vi_ecwmin', 'he_mu_edca_ac_vi_ecwmax',
+			'he_mu_edca_ac_vi_aifsn', 'he_mu_edca_ac_vi_aci', 'he_mu_edca_ac_vi_timer',
+			'he_mu_edca_ac_vo_aifsn', 'he_mu_edca_ac_vo_aci', 'he_mu_edca_ac_vo_ecwmin',
+			'he_mu_edca_ac_vo_ecwmax', 'he_mu_edca_ac_vo_timer',
+		]);
+	}
+
+	if (wildcard(config.htmode, 'EHT*')) {
+		config.ieee80211be = true;
+		append_vars(config, [ 'ieee80211be' ]);
+
+		if (config.hw_mode == 'a')
+			append_vars(config, [ 'eht_oper_chwidth', 'eht_oper_centr_freq_seg0_idx' ]);
+	}
+
+	append_vars(config, [ 'tx_queue_data2_burst', 'stationary_ap' ]);
 }
 
-function ex_wrap(func) {
-	return (req) => {
-		try {
-			let ret = func(req);
-			return ret;
-		} catch(e) {
-			hostapd.printf(`Exception in ubus function: ${e}\n${e.stacktrace[0].context}`);
-		}
-		return libubus.STATUS_UNKNOWN_ERROR;
+function device_extended_features(data, flag) {
+	return !!(data[flag / 8] | (1 << (flag % 8)));
+}
+
+function device_capabilities(config) {
+	let phy = config.phy;
+
+	phy = wiphy_info(phy);
+	let band = wiphy_band(phy, config.band);
+
+	phy_capabilities.ht_capa = band.ht_capa ?? 0;
+	phy_capabilities.vht_capa = band.vht_capa ?? 0;
+	for (let iftype in band.iftype_data) {
+		if (!iftype.iftypes.ap)
+			continue;
+		phy_capabilities.he_mac_cap = iftype.he_cap_mac;
+		phy_capabilities.he_phy_cap = iftype.he_cap_phy;
+	}
+
+	phy_features.ftm_responder = device_extended_features(phy.extended_features, NL80211_EXT_FEATURE_ENABLE_FTM_RESPONDER);
+	phy_features.radar_background = device_extended_features(phy.extended_features, NL80211_EXT_FEATURE_RADAR_BACKGROUND);
+}
+
+function generate(config) {
+	if (!config)
+		die(`${config.path} is an unknown phy`);
+
+	device_capabilities(config);
+
+	append('driver', 'nl80211');
+
+	set_device_defaults(config);
+
+	device_log_append(config);
+
+	device_country_code(config);
+
+	device_cell_density_append(config);
+
+	device_rates(config);
+
+	/* beacon */
+	append_vars(config, [ 'beacon_int', 'beacon_rate', 'rnr_beacon' ]);
+
+	/* wpa_supplicant co-exist */
+	append_vars(config, [ 'noscan' ]);
+
+	/* airtime */
+	if (config.airtime_mode)
+		append_vars(config, [ 'airtime_mode' ]);
+
+	/* assoc/thresholds */
+	append_vars(config, [ 'rssi_reject_assoc_rssi', 'rssi_reject_assoc_timeout', 'rssi_ignore_probe_request', 'iface_max_num_sta' ]);
+
+	/* ACS / Radar*/
+	if (!phy_features.radar_background || config.band != '5g')
+		delete config.enable_background_radar;
+	else
+		set_default(config, 'enable_background_radar', false);
+
+	append_vars(config, [ 'acs_chan_bias', 'acs_exclude_dfs', 'enable_background_radar' ]);
+
+	/* TX Power */
+	append_vars(config, [ 'min_tx_power' ]);
+
+	/* hwmode, channel, op_class, ... */
+	append_vars(config, [ 'hw_mode', 'channel', 'rts_threshold', 'chanlist' ]);
+	if (config.hw_mode in [ 'a', 'g' ] && config.require_mode in [ 'n', 'ac', 'ax' ]) {
+		let require_mode = { n: 'require_ht', ac: 'require_vht', ax: 'require_he' };
+
+		config.legacy_rates = false;
+		append(require_mode[config.require_mode], 1);
+	}
+	device_htmode_append(config);
+
+	if (config.ieee80211ax || config.ieee80211be)
+		append_vars(config, [ 'mbssid' ]);
+
+	/* 6G power mode */
+	if (config.band != '6g')
+		append_vars(config, [ 'reg_power_type' ]);
+
+	/* raw options */
+	for (let raw in config.hostapd_options)
+		append_raw(raw);
+}
+
+let iface_idx = 0;
+function setup_interface(interface, data, config, vlans, stas, phy_features, fixup) {
+	config = { ...config, fixup };
+
+	config.idx = iface_idx++;
+	ap.generate(interface, data, config, vlans, stas, phy_features);
+}
+
+export function setup(data) {
+	let file_name = `/var/run/hostapd-${data.phy}${data.vif_phy_suffix}.conf`;
+
+	flush_config();
+
+	if (fs.stat(file_name))
+		fs.rename(file_name, file_name + '.prev');
+
+	data.config.phy = data.phy;
+
+	generate(data.config);
+
+	if (data.config.num_global_macaddr)
+		append('\n#num_global_macaddr', data.config.num_global_macaddr);
+	if (data.config.macaddr_base)
+		append('\n#macaddr_base', data.config.macaddr_base);
+
+	let has_ap;
+	for (let k, interface in data.interfaces) {
+		if (interface.config.mode != 'ap')
+			continue;
+
+		interface.config.network_bridge = interface.bridge;
+		interface.config.network_ifname = interface['bridge-ifname'];
+
+		let owe = interface.config.encryption == 'owe' && interface.config.owe_transition;
+
+		setup_interface(k, data, interface.config, interface.vlans, interface.stas, phy_features, owe ? 'owe' : null );
+		if (owe)
+			setup_interface(k, data, interface.config, interface.vlans, interface.stas, phy_features, 'owe-transition');
+		has_ap = true;
+	}
+
+	let config = dump_config(file_name);
+
+	let msg = {
+		phy: data.phy,
+		radio: data.config.radio,
+		config: has_ap ? file_name : "",
+		prev_config: file_name + '.prev'
 	};
-}
+	if (!global.ubus.list('hostapd'))
+		system('ubus wait_for hostapd');
+	let ret = global.ubus.call('hostapd', 'config_set', msg);
 
-function phy_name(phy, radio)
-{
-	if (!phy)
-		return null;
-
-	if (radio != null && radio >= 0)
-		phy += "." + radio;
-
-	return phy;
-}
-
-function bss_config(bss_name) {
-	for (let phy, config in hostapd.data.config) {
-		if (!config)
-			continue;
-
-		for (let bss in config.bss)
-			if (bss.ifname == bss_name)
-				return [ config, bss ];
-	}
-}
-
-let main_obj = {
-	reload: {
-		args: {
-			phy: "",
-			radio: 0,
-		},
-		call: ex_wrap(function(req) {
-			let phy_list = req.args.phy ? [ phy_name(req.args.phy, req.args.radio) ] : keys(hostapd.data.config);
-			for (let phy_name in phy_list) {
-				let phy = hostapd.data.config[phy_name];
-				let config = iface_load_config(phy.phy, phy.radio_idx, phy.orig_file);
-				iface_set_config(phy_name, config);
-			}
-
-			return 0;
-		})
-	},
-	apsta_state: {
-		args: {
-			phy: "",
-			radio: 0,
-			up: true,
-			frequency: 0,
-			sec_chan_offset: 0,
-			csa: true,
-			csa_count: 0,
-		},
-		call: ex_wrap(function(req) {
-			let phy = phy_name(req.args.phy, req.args.radio);
-			if (req.args.up == null || !phy)
-				return libubus.STATUS_INVALID_ARGUMENT;
-
-			let config = hostapd.data.config[phy];
-			if (!config || !config.bss || !config.bss[0] || !config.bss[0].ifname)
-				return 0;
-
-			let iface = hostapd.interfaces[phy];
-			if (!iface)
-				return 0;
-
-			if (!req.args.up) {
-				iface.stop();
-				return 0;
-			}
-
-			if (!req.args.frequency)
-				return libubus.STATUS_INVALID_ARGUMENT;
-
-			let freq_info = iface_freq_info(iface, config, req.args);
-			if (!freq_info)
-				return libubus.STATUS_UNKNOWN_ERROR;
-
-			let ret;
-			if (req.args.csa) {
-				freq_info.csa_count = req.args.csa_count ?? 10;
-				ret = iface.switch_channel(freq_info);
-			} else {
-				ret = iface.start(freq_info);
-			}
-			if (!ret)
-				return libubus.STATUS_UNKNOWN_ERROR;
-
-			return 0;
-		})
-	},
-	config_get_macaddr_list: {
-		args: {
-			phy: "",
-			radio: 0,
-		},
-		call: ex_wrap(function(req) {
-			let phy = phy_name(req.args.phy, req.args.radio);
-			if (!phy)
-				return libubus.STATUS_INVALID_ARGUMENT;
-
-			let ret = {
-				macaddr: [],
-			};
-
-			let config = hostapd.data.config[phy];
-			if (!config)
-				return ret;
-
-			ret.macaddr = map(config.bss, (bss) => bss.bssid);
-			return ret;
-		})
-	},
-	config_set: {
-		args: {
-			phy: "",
-			radio: 0,
-			config: "",
-			prev_config: "",
-		},
-		call: ex_wrap(function(req) {
-			let phy = req.args.phy;
-			let radio = req.args.radio;
-			let name = phy_name(phy, radio);
-			let file = req.args.config;
-			let prev_file = req.args.prev_config;
-
-			if (!phy)
-				return libubus.STATUS_INVALID_ARGUMENT;
-
-			if (prev_file && !hostapd.data.config[name]) {
-				let config = iface_load_config(phy, radio, prev_file);
-				if (config)
-					config.radio.data = [];
-				hostapd.data.config[name] = config;
-			}
-
-			let config = iface_load_config(phy, radio, file);
-
-			hostapd.printf(`Set new config for phy ${name}: ${file}`);
-			iface_set_config(name, config);
-
-			if (hostapd.data.auth_obj)
-				hostapd.data.auth_obj.notify("reload", { phy, radio });
-
-			return {
-				pid: hostapd.getpid()
-			};
-		})
-	},
-	config_add: {
-		args: {
-			iface: "",
-			config: "",
-		},
-		call: ex_wrap(function(req) {
-			if (!req.args.iface || !req.args.config)
-				return libubus.STATUS_INVALID_ARGUMENT;
-
-			if (hostapd.add_iface(`bss_config=${req.args.iface}:${req.args.config}`) < 0)
-				return libubus.STATUS_INVALID_ARGUMENT;
-
-			return {
-				pid: hostapd.getpid()
-			};
-		})
-	},
-	config_remove: {
-		args: {
-			iface: ""
-		},
-		call: ex_wrap(function(req) {
-			if (!req.args.iface)
-				return libubus.STATUS_INVALID_ARGUMENT;
-
-			hostapd.remove_iface(req.args.iface);
-			return 0;
-		})
-	},
-	bss_info: {
-		args: {
-			iface: ""
-		},
-		call: ex_wrap(function(req) {
-			if (!req.args.iface)
-				return libubus.STATUS_INVALID_ARGUMENT;
-
-			let config = bss_config(req.args.iface);
-			if (!config)
-				return libubus.STATUS_NOT_FOUND;
-
-			let bss = config[1];
-			config = config[0];
-			let ret = {};
-
-			for (let line in [ ...config.radio.data, ...bss.data ]) {
-				let fields = split(line, "=", 2);
-				let name = fields[0];
-				if (hostapd.data.bss_info_fields[name])
-					ret[name] = fields[1];
-			}
-
-			return ret;
-		})
-	},
-};
-
-hostapd.data.ubus = ubus;
-hostapd.data.obj = ubus.publish("hostapd", main_obj);
-
-
-let auth_obj = {};
-hostapd.data.auth_obj = ubus.publish("hostapd-auth", auth_obj);
-hostapd.udebug_set("hostapd", hostapd.data.ubus);
-
-function bss_event(type, name, data) {
-	let ubus = hostapd.data.ubus;
-
-	data ??= {};
-	data.name = name;
-	hostapd.data.obj.notify(`bss.${type}`, data, null, null, null, -1);
-	ubus.call("service", "event", { type: `hostapd.${name}.${type}`, data: {} });
-}
-
-return {
-	shutdown: function() {
-		for (let phy in hostapd.data.config)
-			iface_set_config(phy);
-		hostapd.udebug_set(null);
-		hostapd.ubus.disconnect();
-	},
-	bss_create: function(phy, name, obj) {
-		phy = hostapd.data.config[phy];
-		if (!phy)
-			return;
-
-		if (phy.radio_idx != null && phy.radio_idx >= 0)
-			wdev_set_radio_mask(name, 1 << phy.radio_idx);
-	},
-	bss_add: function(phy, name, obj) {
-		bss_event("add", name);
-	},
-	bss_reload: function(phy, name, obj, reconf) {
-		bss_event("reload", name, { reconf: reconf != 0 });
-	},
-	bss_remove: function(phy, name, obj) {
-		bss_event("remove", name);
-	},
-	sta_auth: function(iface, sta) {
-		let msg = { iface, sta };
-		let ret = {};
-		let data_cb = (type, data) => {
-			ret = { ...ret, ...data };
-		};
-		if (hostapd.data.auth_obj)
-			hostapd.data.auth_obj.notify("sta_auth", msg, data_cb, null, null, 1000);
-		return ret;
-	},
-	sta_connected: function(iface, sta, data) {
-		let msg = { iface, sta, ...data };
-		let ret = {};
-		let data_cb = (type, data) => {
-			ret = { ...ret, ...data };
-		};
-		if (hostapd.data.auth_obj)
-			hostapd.data.auth_obj.notify("sta_connected", msg, data_cb, null, null, 1000);
-		return ret;
-	},
+	if (ret)
+		netifd.add_process('/usr/sbin/hostapd', ret.pid, true, true);
+	else
+		netifd.setup_failed('HOSTAPD_START_FAILED');
 };
